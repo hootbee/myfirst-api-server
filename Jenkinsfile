@@ -1,28 +1,19 @@
-// ============================================================
-// Jenkinsfile-CI-buildkit (PVC로 파일 공유, 독립된 빌드 에이전트)
-// ※ ArgoCD GitOps 방식으로 배포 (Jenkins는 gitops 브랜치만 업데이트)
-//
-// [Stage 흐름 및 Pod 배치]
-//   1. Clone Repository              : maven Pod    → PVC에 소스 클론
-//   2. Build with Maven              : maven Pod    → PVC에서 빌드, target/*.jar 생성
-//   3. Image Build & Push (BuildKit) : buildkit Pod → PVC의 소스+jar로 이미지 빌드 후 Harbor 푸시
-//   4. GitOps Update                  : maven Pod    → kustomize/overlays/dev 이미지 태그 수정 후 gitops 브랜치 푸시
-// ============================================================
 pipeline {
-  // stage별로 독립 Pod 사용 (PVC로 파일 공유)
-  agent none
+  agent any
 
   environment {
     // === 사용자 수정 영역 ===
     GIT_URL                = 'https://github.com/hootbee/myfirst-api-server.git'
-    GIT_BRANCH             = 'main'
-    GIT_ID                 = 'skala-github-id'
+    GIT_BRANCH             = 'main'            // 또는 main
+    GIT_ID                 = 'skala-github-id'   // GitHub PAT credential ID
     IMAGE_NAME             = 'sk199-webserver'
     // =======================
     IMAGE_TAG              = '1.0'
     IMAGE_REGISTRY_URL     = 'skala-registry.skala-ai.com'
     IMAGE_REGISTRY_PROJECT = 'class-6'
-    DOCKER_CREDENTIAL_ID   = 'skala-image-registry-id'
+
+    DOCKER_CREDENTIAL_ID   = 'skala-image-registry-id'  // Harbor 인증 정보 ID
+    K8S_NAMESPACE          = 'class-6'
     GITOPS_BRANCH          = 'gitops'
     GITOPS_MANIFEST_DIR    = 'kustomize/overlays/dev'
   }
@@ -37,80 +28,58 @@ pipeline {
   }
 
   stages {
-
-    // ── 소스 클론 ── [maven Pod + PVC] ───────────────────────────────────────
-    // ※ JENKINS-30600: git step은 container() 블록을 무시하고 항상 jnlp에서 실행됨
-    //    → git config safe.directory도 jnlp에서 설정해야 함 (container 래퍼 제거)
     stage('Clone Repository') {
-      agent { label 'maven' }       // maven Pod 생성, PVC → /home/jenkins/agent
       steps {
-        sh 'git config --global --add safe.directory "*"'
         echo 'Clone Repository'
         git branch: "${GIT_BRANCH}", url: "${GIT_URL}", credentialsId: "${GIT_ID}"
-        script {
-          // 이미지 태그 = IMAGE_TAG-빌드번호-커밋해시(7자리), 이후 스테이지(이미지 빌드/GitOps)에서 동일 값 사용
-          // ※ kaniko/buildkit 등 빌드 컨테이너에는 git이 없을 수 있으므로 클론 직후 여기서 계산
-          def shortCommit = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
-          env.FINAL_IMAGE_TAG = "${env.IMAGE_TAG}-${env.BUILD_NUMBER}-${shortCommit}"
-        }
         sh 'ls -al'
       }
     }
 
-    // ── Maven 빌드 ── [maven Pod + PVC] ───────────────────────────────────────
     stage('Build with Maven') {
-      agent { label 'maven' }       // 새 maven Pod, PVC에서 소스 읽어 빌드
       steps {
-        container('maven') {
-          echo 'Build with Maven'
-          sh 'mvn clean package -DskipTests'
-          sh 'ls -al'
-        }
+        echo 'Build with Maven'
+        sh 'mvn clean package -DskipTests'
+        sh 'ls -al'
       }
     }
 
-    // ── 이미지 빌드 & 푸시 ── [buildkit Pod + PVC] ──────────────────────────────
-    //      PVC에 있는 소스코드 + target/*.jar + Dockerfile을 buildkit Pod에서 직접 사용
-    //      인증: Jenkins credential(skala-image-registry-id) → ~/.docker/config.json 생성
-    stage('Image Build & Push (BuildKit)') {
-      agent { label 'buildkit' }    // buildkit Pod 생성, PVC → /home/jenkins/agent
+    // 로그인/빌드/푸시/정리
+    stage('Image Build & Push (Buildah)') {
       steps {
         withCredentials([usernamePassword(
           credentialsId: "${DOCKER_CREDENTIAL_ID}",
           usernameVariable: 'REG_USER',
           passwordVariable: 'REG_PASS'
         )]) {
-          container('buildkit') {
-            sh '''
-              set -eux
-              IMAGE_REF="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}:${FINAL_IMAGE_TAG}"
+        script {
+          // 이미지 태그 = IMAGE_TAG-빌드번호-커밋해시(7자리), GitOps 스테이지에서도 동일 값 사용
+          def shortCommit = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+          env.FINAL_IMAGE_TAG = "${env.IMAGE_TAG}-bd${env.BUILD_NUMBER}-${shortCommit}"
+        }
+        sh '''
+            set -eux
+            REG_HOST="${IMAGE_REGISTRY_URL}"
+            IMAGE_REF="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}:${FINAL_IMAGE_TAG}"
 
-              # 인증: Jenkins credential(skala-image-registry-id)에서 가져온 username/password로 config.json 생성
-              # buildkit은 DOCKER_CONFIG(기본 ~/.docker)의 config.json을 읽어 레지스트리 인증
-              mkdir -p ~/.docker
-              AUTH=$(printf '%s:%s' "${REG_USER}" "${REG_PASS}" | base64 | tr -d '\n')
-              cat > ~/.docker/config.json << EOF
-{"auths":{"${IMAGE_REGISTRY_URL}":{"auth":"${AUTH}"}}}
-EOF
+            # 1. 로그인
+            echo "Login to $REG_HOST as $REG_USER"
+            sudo buildah login -u "$REG_USER" -p "$REG_PASS" "$REG_HOST"
 
-              buildctl-daemonless.sh build \
-                --frontend dockerfile.v0 \
-                --local context=. \
-                --local dockerfile=. \
-                --opt platform=linux/amd64 \
-                --output type=image,name="${IMAGE_REF}",push=true
-              # buildctl-daemonless.sh : rootless buildkitd를 즉석에서 띄워 빌드+푸시까지 한 번에 수행 (kaniko executor와 동일한 역할)
-              # TLS 오류 발생 시 --output 뒤에 ,registry.insecure=true 추가
-            '''
-          }
+            # 2. 빌드
+            sudo buildah bud --storage-driver vfs --platform "linux/amd64" -t "${IMAGE_REF}" .
+            # 3. 푸시
+            sudo buildah push --storage-driver vfs "${IMAGE_REF}"
+            # 4. 정리
+            sudo buildah rmi -a || true
+        '''
         }
       }
     }
 
-    // ── GitOps 업데이트 (ArgoCD CD 트리거) ── [maven Pod + PVC] ──────────────────
+    // GitOps 업데이트 (ArgoCD CD 트리거) ────────────────
     // kustomize/overlays/dev 이미지 태그 수정 후 gitops 브랜치에 push
     stage('GitOps Update') {
-      agent { label 'maven' }       // maven Pod, PVC에 있는 kustomize/overlays/dev 직접 수정 (해당 Pod 이미지에 kustomize CLI 필요)
       steps {
         withCredentials([usernamePassword(
           credentialsId: "${GIT_ID}",
@@ -150,15 +119,11 @@ EOF
       }
     }
 
-  } // stages
+  }
 
   post {
     always {
-      // PVC 워크스페이스 정리: git clone, target/, 빌드 아티팩트 삭제
-      // agent none 파이프라인은 post에 node() 블록이 필요, workspace 루트 자체는 유지(rm -rf ${WORKSPACE} 시 durable task 상태파일 손실)
-      node('maven') {
-        sh 'rm -rf "${WORKSPACE}"/* 2>/dev/null || true'
-      }
+      deleteDir()  // 워크스페이스 정리 (git clone, target/, 빌드 아티팩트)
     }
   }
 }
