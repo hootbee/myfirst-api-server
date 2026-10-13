@@ -1,11 +1,12 @@
 // ============================================================
-// Jenkinsfile-CICD with Kaniko (PVC로 파일 공유, 독립된 빌드 에이전트)
+// Jenkinsfile-CI-buildkit (PVC로 파일 공유, 독립된 빌드 에이전트)
+// ※ ArgoCD GitOps 방식으로 배포 (Jenkins는 gitops 브랜치만 업데이트)
+//
 // [Stage 흐름 및 Pod 배치]
-//   1. Clone Repository            : maven Pod   → PVC에 소스 클론
-//   2. Build with Maven            : maven Pod   → PVC에서 빌드, target/*.jar 생성
-//   3. Image Build & Push (Kaniko) : kaniko Pod  → PVC의 소스+jar로 이미지 빌드 후 Harbor 푸시
-//   4. Update K8s Manifests        : maven Pod   → kustomize/overlays/dev 이미지 태그를 kustomize edit set image로 갱신 후 렌더링
-//   5. Deploy to Kubernetes        : kubectl Pod → 렌더링된 매니페스트를 kubectl apply + rollout 대기
+//   1. Clone Repository              : maven Pod    → PVC에 소스 클론
+//   2. Build with Maven              : maven Pod    → PVC에서 빌드, target/*.jar 생성
+//   3. Image Build & Push (BuildKit) : buildkit Pod → PVC의 소스+jar로 이미지 빌드 후 Harbor 푸시
+//   4. GitOps Update                  : maven Pod    → kustomize/overlays/dev 이미지 태그 수정 후 gitops 브랜치 푸시
 // ============================================================
 pipeline {
   // stage별로 독립 Pod 사용 (PVC로 파일 공유)
@@ -22,13 +23,17 @@ pipeline {
     IMAGE_REGISTRY_URL     = 'skala-registry.skala-ai.com'
     IMAGE_REGISTRY_PROJECT = 'class-6'
     DOCKER_CREDENTIAL_ID   = 'skala-image-registry-id'
-    K8S_NAMESPACE          = 'class-6'
-    DEPLOYMENT_NAME        = 'sk199-myfirst-api-server'  // kustomize/base/deployment.yaml의 metadata.name과 동일해야 함
+    GITOPS_BRANCH          = 'gitops'
+    GITOPS_MANIFEST_DIR    = 'kustomize/overlays/dev'
   }
 
   options {
     disableConcurrentBuilds()
     timestamps()
+  }
+
+  triggers {
+    pollSCM('* * * * *')   // 1분마다 main 브랜치 변경 확인
   }
 
   stages {
@@ -42,6 +47,12 @@ pipeline {
         sh 'git config --global --add safe.directory "*"'
         echo 'Clone Repository'
         git branch: "${GIT_BRANCH}", url: "${GIT_URL}", credentialsId: "${GIT_ID}"
+        script {
+          // 이미지 태그 = IMAGE_TAG-빌드번호-커밋해시(7자리), 이후 스테이지(이미지 빌드/GitOps)에서 동일 값 사용
+          // ※ kaniko/buildkit 등 빌드 컨테이너에는 git이 없을 수 있으므로 클론 직후 여기서 계산
+          def shortCommit = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+          env.FINAL_IMAGE_TAG = "${env.IMAGE_TAG}-${env.BUILD_NUMBER}-${shortCommit}"
+        }
         sh 'ls -al'
       }
     }
@@ -58,102 +69,82 @@ pipeline {
       }
     }
 
-    // ── 이미지 빌드 & 푸시 ── [kaniko Pod + PVC] ──────────────────────────────
-    //      PVC에 있는 소스코드 + target/*.jar + Dockerfile을 kaniko Pod에서 직접 사용
-    //      인증: Jenkins credential(skala-image-registry-id) → /kaniko/.docker/config.json 생성
-    stage('Image Build & Push (Kaniko)') {
-      agent { label 'kaniko' }      // kaniko Pod 생성, PVC → /home/jenkins/agent
+    // ── 이미지 빌드 & 푸시 ── [buildkit Pod + PVC] ──────────────────────────────
+    //      PVC에 있는 소스코드 + target/*.jar + Dockerfile을 buildkit Pod에서 직접 사용
+    //      인증: Jenkins credential(skala-image-registry-id) → ~/.docker/config.json 생성
+    stage('Image Build & Push (BuildKit)') {
+      agent { label 'buildkit' }    // buildkit Pod 생성, PVC → /home/jenkins/agent
       steps {
         withCredentials([usernamePassword(
           credentialsId: "${DOCKER_CREDENTIAL_ID}",
           usernameVariable: 'REG_USER',
           passwordVariable: 'REG_PASS'
         )]) {
-          container('kaniko') {
+          container('buildkit') {
             sh '''
               set -eux
-              IMAGE_REF="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}-${BUILD_NUMBER}"
+              IMAGE_REF="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}:${FINAL_IMAGE_TAG}"
 
               # 인증: Jenkins credential(skala-image-registry-id)에서 가져온 username/password로 config.json 생성
-              # kaniko는 DOCKER_CONFIG=/kaniko/.docker 의 config.json을 읽어 레지스트리 인증
-              mkdir -p /kaniko/.docker
+              # buildkit은 DOCKER_CONFIG(기본 ~/.docker)의 config.json을 읽어 레지스트리 인증
+              mkdir -p ~/.docker
               AUTH=$(printf '%s:%s' "${REG_USER}" "${REG_PASS}" | base64 | tr -d '\n')
-              cat > /kaniko/.docker/config.json << EOF
+              cat > ~/.docker/config.json << EOF
 {"auths":{"${IMAGE_REGISTRY_URL}":{"auth":"${AUTH}"}}}
 EOF
 
-              /kaniko/executor \
-                --dockerfile=Dockerfile \
-                --context=dir://${WORKSPACE} \
-                --destination="${IMAGE_REF}" \
-                --force
-              # --dockerfile=Dockerfile   : context 루트 기준 상대 경로
-              # --context=dir://$WORKSPACE: PVC의 실제 소스 경로 (Jenkins가 설정한 workspace)
-              # TLS 오류 발생 시 아래 옵션 추가:
-              #   --skip-tls-verify-registry=${IMAGE_REGISTRY_URL}
+              buildctl-daemonless.sh build \
+                --frontend dockerfile.v0 \
+                --local context=. \
+                --local dockerfile=. \
+                --opt platform=linux/amd64 \
+                --output type=image,name="${IMAGE_REF}",push=true
+              # buildctl-daemonless.sh : rootless buildkitd를 즉석에서 띄워 빌드+푸시까지 한 번에 수행 (kaniko executor와 동일한 역할)
+              # TLS 오류 발생 시 --output 뒤에 ,registry.insecure=true 추가
             '''
           }
         }
       }
     }
 
-    // ── k8s 매니페스트 이미지 태그 업데이트 ── [maven Pod + PVC] ───────────────
-    //      kustomize/overlays/dev 이미지 태그 갱신 후, kubectl Pod에서 kustomize 없이도 적용 가능하도록 미리 렌더링
-    //      (해당 Pod 이미지에 kustomize CLI 필요)
-    stage('Update K8s Manifests') {
-      agent { label 'maven' }
+    // ── GitOps 업데이트 (ArgoCD CD 트리거) ── [maven Pod + PVC] ──────────────────
+    // kustomize/overlays/dev 이미지 태그 수정 후 gitops 브랜치에 push
+    stage('GitOps Update') {
+      agent { label 'maven' }       // maven Pod, PVC에 있는 kustomize/overlays/dev 직접 수정 (해당 Pod 이미지에 kustomize CLI 필요)
       steps {
-        container('maven') {
+        withCredentials([usernamePassword(
+          credentialsId: "${GIT_ID}",
+          usernameVariable: 'GIT_USER',
+          passwordVariable: 'GIT_PASS'
+        )]) {
+          script {
+            env.REPO_PATH = env.GIT_URL.replaceFirst(/^https?:\/\//, '')
+          }
           sh '''
             set -eux
-            test -d ./kustomize/overlays/dev
+            git config --global user.name  "skala-gitops"
+            git config --global user.email "skala@skala-ai.com"
+            git config --global --add safe.directory '*'
+            git remote set-url origin "https://${GIT_USER}:${GIT_PASS}@${REPO_PATH}"
 
-            FINAL_IMAGE_TAG="${IMAGE_TAG}-${BUILD_NUMBER}"
             IMAGE_BASE="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}"
 
-            # 1. 이미지 태그 업데이트 (이후 명령은 원래 디렉토리에서 실행해야 하므로 서브셸 사용)
-            (cd ./kustomize/overlays/dev && kustomize edit set image "${IMAGE_BASE}=${IMAGE_BASE}:${FINAL_IMAGE_TAG}")
+            # 1. 원격 gitops 브랜치가 있으면 그 히스토리를 이어받고, 없으면 현재 브랜치 기준으로 생성
+            git fetch origin "${GITOPS_BRANCH}" || true
+            if git rev-parse --verify "origin/${GITOPS_BRANCH}" >/dev/null 2>&1; then
+              git checkout -B "${GITOPS_BRANCH}" "origin/${GITOPS_BRANCH}"
+            else
+              git checkout -B "${GITOPS_BRANCH}"
+            fi
 
-            # 2. kubectl Pod에서 그대로 적용할 수 있도록 렌더링 결과를 PVC에 저장
-            kustomize build ./kustomize/overlays/dev > ./rendered-manifest.yaml
+            # 2. kustomize/overlays/dev 이미지 태그 업데이트 (이후 명령은 원래 디렉토리에서 실행해야 하므로 서브셸 사용)
+            (cd "${GITOPS_MANIFEST_DIR}" && kustomize edit set image "${IMAGE_BASE}=${IMAGE_BASE}:${FINAL_IMAGE_TAG}")
 
-            # ===== DEBUG:START =====
-            echo "--- rendered-manifest.yaml ---"
-            cat ./rendered-manifest.yaml
-            # ===== DEBUG:END =====
-          '''
-        }
-      }
-    }
-
-    // ── Kubernetes 직접 배포 ── [kubectl Pod + PVC] ────────────────────────────
-    //      PVC에 렌더링된 매니페스트(rendered-manifest.yaml)를 kubectl apply로 배포
-    //      [주의] skala-admin-sa ServiceAccount에 deployments 쓰기 권한 필요
-    //             (01-rbac.yaml 업데이트 필요)
-    stage('Deploy to Kubernetes') {
-      agent { label 'kubectl' }     // kubectl Pod, serviceAccount: skala-admin-sa
-      steps {
-        container('kubectl') {
-          sh '''
-            set -eux
-
-            # ===== DEBUG:START =====
-            echo "=== [DEBUG] Deploy to Kubernetes stage ==="
-            echo "K8S_NAMESPACE=${K8S_NAMESPACE}"
-            echo "DEPLOYMENT_NAME=${DEPLOYMENT_NAME}"
-            kubectl version --client 2>&1 | head -1 || echo "kubectl not found!"
-            # ===== DEBUG:END =====
-
-            echo "=== rendered manifest 적용 ==="
-            kubectl apply -n "${K8S_NAMESPACE}" -f ./rendered-manifest.yaml
-
-            echo "=== 배포 롤아웃 대기 ==="
-            kubectl rollout status deployment/"${DEPLOYMENT_NAME}" \
-              -n "${K8S_NAMESPACE}" \
-              --timeout=180s
-
-            echo "=== 배포 완료 ==="
-            kubectl get pods -n "${K8S_NAMESPACE}" -l "app=${DEPLOYMENT_NAME}"
+            # 3. 커밋 & 푸시 (원격 히스토리를 이어받았으므로 fast-forward push, --force 불필요)
+            git add "${GITOPS_MANIFEST_DIR}/kustomization.yaml"
+            git commit -m "[AUTO] image: ${IMAGE_NAME}:${FINAL_IMAGE_TAG}"
+            git push origin "${GITOPS_BRANCH}"
+            echo "[DONE] gitops 브랜치 업데이트 완료: ${IMAGE_BASE}:${FINAL_IMAGE_TAG}"
           '''
         }
       }
