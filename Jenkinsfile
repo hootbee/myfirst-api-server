@@ -24,7 +24,8 @@ pipeline {
   }
 
   triggers {
-    pollSCM('* * * * *')   // 1분마다 main 브랜치 변경 확인
+    githubPush()             // GitHub webhook 수신 시 즉시 빌드
+    pollSCM('* * * * *')     // 백업: 1분마다 main 브랜치 변경 확인
   }
 
   stages {
